@@ -49,10 +49,15 @@ HTTPX_MAX_KEEPALIVE = 500
 # ── 日志配置 ───────────────────────────────────────────────────
 LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
 
+# ── 输出与清理配置 ─────────────────────────────────────────────
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"))
+IMAGE_TTL_SECONDS = int(os.getenv("IMAGE_TTL_SECONDS", "900"))  # 默认 15 分钟
+
 # ── 全局资源 ───────────────────────────────────────────────────
 submit_semaphore: asyncio.Semaphore
 download_semaphore: asyncio.Semaphore
 http_client: httpx.AsyncClient
+cleanup_task: asyncio.Task
 
 
 # ── 日志记录 ──────────────────────────────────────────────────
@@ -96,9 +101,29 @@ class UpstreamError(Exception):
 
 
 # ── 生命周期 ──────────────────────────────────────────────────
+async def _cleanup_old_images():
+    """后台循环：删除超过 IMAGE_TTL_SECONDS 的图片文件"""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not os.path.isdir(OUTPUT_DIR):
+                continue
+            cutoff = time.time() - IMAGE_TTL_SECONDS
+            count = 0
+            for fname in os.listdir(OUTPUT_DIR):
+                fpath = os.path.join(OUTPUT_DIR, fname)
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    count += 1
+            if count:
+                logger.info("已清理 %d 张过期图片", count)
+        except Exception:
+            logger.exception("清理图片失败")
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global submit_semaphore, download_semaphore, http_client
+    global submit_semaphore, download_semaphore, http_client, cleanup_task
     submit_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SUBMITS)
     download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     http_client = httpx.AsyncClient(
@@ -108,9 +133,11 @@ async def lifespan(application: FastAPI):
         ),
         timeout=httpx.Timeout(60.0, connect=10.0),
     )
-    logger.info("服务启动 | 最大提交并发=%d | 最大下载并发=%d | 连接池=%d",
-                MAX_CONCURRENT_SUBMITS, MAX_CONCURRENT_DOWNLOADS, HTTPX_MAX_CONNECTIONS)
+    cleanup_task = asyncio.create_task(_cleanup_old_images())
+    logger.info("服务启动 | 最大提交并发=%d | 最大下载并发=%d | 连接池=%d | 图片保留=%ds",
+                MAX_CONCURRENT_SUBMITS, MAX_CONCURRENT_DOWNLOADS, HTTPX_MAX_CONNECTIONS, IMAGE_TTL_SECONDS)
     yield
+    cleanup_task.cancel()
     await http_client.aclose()
     logger.info("服务关闭")
 
