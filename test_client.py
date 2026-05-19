@@ -67,6 +67,41 @@ def test_openai_endpoint(prompt="一只在草地上奔跑的金毛犬，阳光�
     print()
 
 
+def test_gemini_endpoint(prompt="一只在草地上奔跑的金毛犬，阳光明媚"):
+    """测试 Gemini 原生 generateContent 接口"""
+    print(f"[Gemini接口] prompt: {prompt}")
+    start = time.time()
+
+    resp = requests.post(
+        f"{BASE}/v1beta/models/gemini-3.0-pro-image-preview:generateContent",
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "responseFormat": {"image": {"aspectRatio": "1:1", "imageSize": "1K"}},
+            },
+        },
+    )
+    elapsed = time.time() - start
+
+    print(f"  状态码: {resp.status_code}")
+    print(f"  耗时: {elapsed:.1f}s")
+
+    data = resp.json()
+    if "error" in data:
+        print(f"  错误: {data['error']}")
+    else:
+        for i, candidate in enumerate(data.get("candidates", [])):
+            for j, part in enumerate(candidate.get("content", {}).get("parts", [])):
+                if "inlineData" in part:
+                    b64_data = part["inlineData"]["data"]
+                    path = save_b64_image(b64_data, i * 10 + j + 1)
+                    print(f"  图片{i+1}-{j+1}: mime={part['inlineData']['mimeType']} ({len(b64_data)} chars)")
+                    print(f"  已保存: {path}")
+
+    print()
+
+
 def test_simple_endpoint(prompt="a mountain landscape with snow"):
     print(f"[简洁接口] prompt: {prompt}")
     start = time.time()
@@ -103,5 +138,6 @@ if __name__ == "__main__":
         test_openai_endpoint(response_format="url")
         test_openai_endpoint(response_format="b64_json")
         test_simple_endpoint()
+        test_gemini_endpoint()
 
     print(f"图片保存在: {OUTPUT_DIR}")

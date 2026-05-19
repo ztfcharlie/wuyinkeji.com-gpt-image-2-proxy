@@ -32,6 +32,7 @@ logger = logging.getLogger("proxy")
 
 # ── 上游 API 配置 ──────────────────────────────────────────────
 UPSTREAM_SUBMIT_URL = "https://api.wuyinkeji.com/api/async/image_gpt"
+UPSTREAM_SUBMIT_URL_NANO = "https://api.wuyinkeji.com/api/async/image_nanoBanana2"
 UPSTREAM_POLL_URL = "https://api.wuyinkeji.com/api/async/detail"
 UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "lA0g3L9wSnM9T70Y6hsxnspZDm")
 POLL_INTERVAL = 3
@@ -445,6 +446,269 @@ async def simple_generate(req: SimpleRequest):
         })
         write_log(log_record)
         raise
+
+
+# ── Gemini 原生接口 (NanoBanana2) ──────────────────────────────
+NANO_MODEL_ALIASES = {
+    "gemini-3.0-pro-image-preview": "NanoBanana2",
+    "gemini-3.1-flash-image-preview": "NanoBanana2",
+    "gemini-2.0-flash-exp": "NanoBanana2",
+    "gemini-2.0-flash-preview-image-generation": "NanoBanana2",
+}
+
+VALID_ASPECT_RATIOS = {
+    "auto", "1:1", "16:9", "9:16", "4:3", "3:4",
+    "3:2", "2:3", "5:4", "4:5", "21:9",
+}
+
+VALID_IMAGE_SIZES = {"1K", "2K", "4K"}
+
+
+def gemini_error_response(status_code: int, message: str, status: str) -> JSONResponse:
+    """生成符合 Google Gemini API 格式的错误响应"""
+    return JSONResponse(status_code=status_code, content={
+        "error": {"code": status_code, "message": message, "status": status}
+    })
+
+
+def _extract_gemini_parts(contents: list) -> tuple[str, list[str]]:
+    """从 Gemini contents 中提取文本 prompt 和参考图 URL/base64"""
+    prompt_parts = []
+    ref_urls = []
+    for content in contents:
+        for part in content.get("parts", []):
+            if "text" in part:
+                prompt_parts.append(part["text"])
+            elif "inlineData" in part or "inline_data" in part:
+                inline = part.get("inlineData") or part.get("inline_data")
+                mime = inline.get("mimeType") or inline.get("mime_type", "")
+                data = inline.get("data", "")
+                if data.startswith("http"):
+                    ref_urls.append(data)
+                else:
+                    ext = "png" if "png" in mime else "jpg"
+                    ref_urls.append(f"data:image/{ext};base64,{data}")
+    return " ".join(prompt_parts), ref_urls
+
+
+def _extract_gemini_config(generation_config: dict | None) -> tuple[str, str]:
+    """从 generationConfig 提取 size 和 aspectRatio"""
+    size = "1K"
+    aspect_ratio = "auto"
+    if not generation_config:
+        return size, aspect_ratio
+    img_cfg = (
+        (generation_config.get("responseFormat") or {}).get("image")
+        or generation_config.get("imageConfig")
+        or {}
+    )
+    if img_cfg.get("imageSize"):
+        s = img_cfg["imageSize"].upper()
+        if s in VALID_IMAGE_SIZES:
+            size = s
+    if img_cfg.get("aspectRatio"):
+        ar = img_cfg["aspectRatio"]
+        if ar in VALID_ASPECT_RATIOS:
+            aspect_ratio = ar
+    return size, aspect_ratio
+
+
+async def submit_and_wait_nano(
+    prompt: str, size: str = "1K", aspect_ratio: str = "auto",
+    reference_urls: list[str] | None = None,
+) -> tuple[list[str], str]:
+    """提交 NanoBanana2 请求并等待结果"""
+    async with submit_semaphore:
+        payload: dict = {"prompt": prompt}
+        if size and size != "1K":
+            payload["size"] = size
+        if aspect_ratio and aspect_ratio != "auto":
+            payload["aspectRatio"] = aspect_ratio
+        if reference_urls:
+            payload["urls"] = reference_urls
+
+        resp = await http_client.post(
+            UPSTREAM_SUBMIT_URL_NANO,
+            headers={"Authorization": UPSTREAM_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        body = resp.json()
+        if body.get("code") != 200:
+            raise UpstreamError(
+                status_code=502,
+                message=body.get("msg", "Unknown upstream error"),
+                error_type="server_error",
+                error_code="upstream_error",
+            )
+        task_id = body["data"]["id"]
+
+    start = time.time()
+    while time.time() - start < MAX_POLL_TIME:
+        await asyncio.sleep(POLL_INTERVAL)
+        resp = await http_client.get(
+            UPSTREAM_POLL_URL, params={"key": UPSTREAM_KEY, "id": task_id}
+        )
+        body = resp.json()
+        task_data = body.get("data", {})
+        status = task_data.get("status")
+
+        if status == 2:
+            return task_data.get("result") or [], task_id
+        if status in (-1, 3):
+            msg = task_data.get("message", "Unknown error")
+            raise UpstreamError(
+                status_code=502,
+                message=msg,
+                error_type="server_error",
+                error_code="generation_failed",
+            )
+
+    raise UpstreamError(
+        status_code=504,
+        message="Image generation timed out",
+        error_type="server_error",
+        error_code="timeout",
+    )
+
+
+@app.post("/v1beta/models/{model:path}:generateContent")
+async def gemini_generate_content(model: str, request: Request):
+    """Gemini 原生 generateContent 接口 → NanoBanana2 异步转同步"""
+    request_id = f"gem_{uuid.uuid4().hex[:16]}"
+    start_time = time.time()
+
+    # 验证 model
+    if model not in NANO_MODEL_ALIASES:
+        return gemini_error_response(404, f"Model `{model}` not found.", "NOT_FOUND")
+
+    # 解析请求体
+    try:
+        body = await request.json()
+    except Exception:
+        return gemini_error_response(400, "Invalid JSON in request body.", "INVALID_ARGUMENT")
+
+    contents = body.get("contents")
+    if not contents or not isinstance(contents, list):
+        return gemini_error_response(400, "Missing or invalid `contents` field.", "INVALID_ARGUMENT")
+
+    generation_config = body.get("generationConfig")
+
+    # 验证 responseModalities
+    modalities = (generation_config or {}).get("responseModalities", [])
+    if isinstance(modalities, str):
+        modalities = [modalities]
+    if "IMAGE" not in modalities and "image" not in [m.lower() for m in modalities]:
+        return gemini_error_response(
+            400,
+            "responseModalities must include 'IMAGE' for image generation.",
+            "INVALID_ARGUMENT",
+        )
+
+    prompt, ref_urls = _extract_gemini_parts(contents)
+    if not prompt:
+        return gemini_error_response(400, "No text prompt found in contents.", "INVALID_ARGUMENT")
+
+    size, aspect_ratio = _extract_gemini_config(generation_config)
+
+    log_record: dict = {
+        "request_id": request_id,
+        "timestamp": datetime.now().isoformat(),
+        "endpoint": f"/v1beta/models/{model}:generateContent",
+        "prompt": prompt[:200],
+        "size": size,
+        "aspect_ratio": aspect_ratio,
+        "reference_count": len(ref_urls),
+    }
+
+    try:
+        urls, upstream_task_id = await submit_and_wait_nano(
+            prompt, size, aspect_ratio, ref_urls if ref_urls else None
+        )
+
+        # 构造 Gemini 格式响应
+        parts = []
+        for url in urls:
+            async with download_semaphore:
+                img_resp = await http_client.get(url)
+                img_resp.raise_for_status()
+                b64 = base64.b64encode(img_resp.content).decode("utf-8")
+            parts.append({
+                "inlineData": {"mimeType": "image/png", "data": b64}
+            })
+
+        response_body = {
+            "candidates": [{
+                "content": {
+                    "parts": parts,
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+                "safetyRatings": [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "probability": "NEGLIGIBLE", "blocked": False},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "NEGLIGIBLE", "blocked": False},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "probability": "NEGLIGIBLE", "blocked": False},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "NEGLIGIBLE", "blocked": False},
+                ],
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 0,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 0,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 0}],
+                "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 0}],
+            },
+            "modelVersion": f"{model}",
+        }
+
+        elapsed = round(time.time() - start_time, 2)
+        log_record.update({
+            "status": "success",
+            "upstream_task_id": upstream_task_id,
+            "image_count": len(urls),
+            "elapsed_seconds": elapsed,
+        })
+        write_log(log_record)
+        return JSONResponse(content=response_body)
+
+    except UpstreamError as e:
+        elapsed = round(time.time() - start_time, 2)
+        log_record.update({
+            "status": "failed",
+            "error_code": e.error_code,
+            "error_message": e.message,
+            "elapsed_seconds": elapsed,
+        })
+        write_log(log_record)
+
+        status_map = {
+            "upstream_error": (400, "INVALID_ARGUMENT"),
+            "generation_failed": (400, "INVALID_ARGUMENT"),
+            "timeout": (504, "DEADLINE_EXCEEDED"),
+        }
+        sc, st = status_map.get(e.error_code, (500, "INTERNAL"))
+        return gemini_error_response(sc, e.message, st)
+
+    except httpx.HTTPStatusError as e:
+        elapsed = round(time.time() - start_time, 2)
+        log_record.update({
+            "status": "failed",
+            "error_code": "download_failed",
+            "error_message": str(e),
+            "elapsed_seconds": elapsed,
+        })
+        write_log(log_record)
+        return gemini_error_response(500, f"Failed to download image: HTTP {e.response.status_code}", "INTERNAL")
+
+    except Exception as e:
+        elapsed = round(time.time() - start_time, 2)
+        log_record.update({
+            "status": "failed",
+            "error_code": "internal_error",
+            "error_message": str(e),
+            "elapsed_seconds": elapsed,
+        })
+        write_log(log_record)
+        return gemini_error_response(500, "Internal server error", "INTERNAL")
 
 
 # ── 健康检查 ──────────────────────────────────────────────────
