@@ -153,7 +153,9 @@ async def auth_middleware(request: Request, call_next):
         if request.url.path == "/health":
             return await call_next(request)
         auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != API_TOKEN:
+        goog_key = request.headers.get("x-goog-api-key", "")
+        key_matched = (auth.startswith("Bearer ") and auth[7:] == API_TOKEN) or goog_key == API_TOKEN
+        if not key_matched:
             return openai_error_response(
                 status_code=401,
                 message="Incorrect API key provided",
